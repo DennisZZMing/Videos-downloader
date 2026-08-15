@@ -1,6 +1,3 @@
-"""
-在独立 QThread 中运行 yt-dlp，向 GUI 回传进度 / 状态
-"""
 from __future__ import annotations
 
 import logging
@@ -8,100 +5,188 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import TypedDict
 
 from PySide6.QtCore import QThread, Signal
 
 log = logging.getLogger(__name__)
 
-# yt-dlp 在子进程中运行，可避免与 Qt 事件循环冲突
-YTDLP_BIN = sys.executable  # 若你愿意可改为本地的 yt-dlp.exe
-#YTDLP_ARGS_BASE = ["-f", "best", "-N", "4", "--no-mtime"]
-YTDLP_ARGS_BASE = ["--no-mtime"]
 
-QUALITY_PRESETS = {
-    "best":  "best",
-    "1080p": "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
-    "720p":  "bestvideo[height<=720]+bestaudio/best[height<=720]",
-    "480p":  "bestvideo[height<=480]+bestaudio/best[height<=480]",
-    "audio": "bestaudio/best",
-}
+class DownloadTask(TypedDict):
+    title: str
+    url: str
+    format_expr: str
+    format_label: str
 
 
 class DownloaderWorker(QThread):
-    progress_sig = Signal(float)  # 0.0 – 1.0
+    progress_sig = Signal(float)
     status_sig = Signal(str)
-    finished_sig = Signal(bool, object)  # success, err_msg
+    finished_sig = Signal(bool, object)
 
-    _PROGRESS_RE = re.compile(
-        r"\[download\]\s+(\d{1,3}\.\d)%\s+of\s+.*?\s+at\s+.*?\s+ETA\s+.*"
-    )
-
-    def __init__(self, urls: str, out_dir: Path):
+    def __init__(self, tasks: list[DownloadTask], out_dir: Path, cookies_browser: str | None = None):
         super().__init__()
-        self._urls = urls
+        self._tasks = tasks
         self._out_dir = out_dir
-        # self._quality = quality
+        self._cookies_browser = cookies_browser
 
-    # ---------- 线程入口 ----------
-    def run(self) -> None:  # noqa: D401
+    def run(self) -> None:
         try:
-            for idx, (url, q) in enumerate(self._urls, 1):
-                self.status_sig.emit(f"({idx}/{len(self._urls)}) 开始下载：{url}")
-                self._invoke_ytdlp(url, q)
+            for index, task in enumerate(self._tasks, 1):
+                self.status_sig.emit(
+                    f"正在下载 ({index}/{len(self._tasks)})：{task['title']} - {task['format_label']}"
+                )
+                self.progress_sig.emit(0.0)
+                self._download_one(task)
+            self.progress_sig.emit(1.0)
             self.finished_sig.emit(True, None)
         except Exception as exc:  # pragma: no cover
-            log.exception("Download failed")
+            log.exception("download failed")
             self.finished_sig.emit(False, str(exc))
 
-    # ---------- 私有 ----------
-    def _invoke_ytdlp(self, url:str, quality: str) -> None:
-        fmt_expr = QUALITY_PRESETS.get(quality, "best")
-        cmd: list[str | Path] = [
-            #YTDLP_BIN,
+    def _download_one(self, task: DownloadTask) -> None:
+        from yt_dlp.utils import DownloadError
+
+        errors: list[str] = []
+        candidates = self._format_candidates(task["format_expr"])
+        for attempt, format_expr in enumerate(candidates, 1):
+            before = self._output_snapshot()
+
+            try:
+                self._run_ytdlp(format_expr, task["url"])
+                return
+            except DownloadError as exc:
+                errors.append(str(exc))
+                self._cleanup_failed_attempt(before)
+                if attempt < len(candidates):
+                    self.status_sig.emit("当前格式下载失败，正在尝试备用格式...")
+                    log.warning("download failed with format %s; trying fallback", format_expr)
+                else:
+                    log.warning("download failed with format %s", format_expr)
+
+        raise DownloadError(_friendly_ytdlp_error(errors[-1] if errors else "download failed"))
+
+    def _format_candidates(self, format_expr: str) -> list[str]:
+        candidates = [format_expr]
+        fallback = "best"
+        if fallback not in candidates:
+            candidates.append(fallback)
+        return candidates
+
+    def _run_ytdlp(self, format_expr: str, url: str) -> None:
+        from yt_dlp.utils import DownloadError
+
+        cmd = [
             sys.executable,
-            "-m",  # 调用模块：python -m yt_dlp …
+            "-m",
             "yt_dlp",
             "-f",
-            fmt_expr,
-            *YTDLP_ARGS_BASE,
+            format_expr,
+            "--no-mtime",
+            "--newline",
+            "--no-playlist",
+            "--merge-output-format",
+            "mp4",
+            "-N",
+            "4",
             "-P",
             str(self._out_dir),
-            "--newline",  # 强制逐行输出，方便解析进度
-            url,
+            "-o",
+            "%(title).200B [%(id)s].%(ext)s",
         ]
-        log.debug("Run: %s", " ".join(map(str, cmd)))
+        if self._cookies_browser:
+            cmd.extend(["--cookies-from-browser", self._cookies_browser])
+        cmd.append(url)
+
+        safe_cmd = ["***" if item == self._cookies_browser else item for item in cmd]
+        log.debug("run yt-dlp: %s", " ".join(safe_cmd))
 
         with subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            encoding="utf-8",          # ★ 指定解码用 UTF-8
-            errors="replace",          # ★ 遇到极端字符用 � 占位而不是炸
-            bufsize=1,  # 行缓冲
-            # universal_newlines=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
         ) as proc:
-            for line in proc.stdout:  # type: ignore[arg-type]
-                self._handle_output(line.strip())
+            assert proc.stdout is not None
+            tail: list[str] = []
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                self._handle_ytdlp_line(line)
+                tail.append(line)
+                tail = tail[-20:]
 
             proc.wait()
-            if proc.returncode != 0:  # pragma: no cover
-                raise RuntimeError(f"yt-dlp exit code {proc.returncode}")
+            if proc.returncode:
+                message = "\n".join(tail) or f"yt-dlp exit code {proc.returncode}"
+                raise DownloadError(_friendly_ytdlp_error(message))
 
-    def _handle_output(self, line: str) -> None:
+    def _handle_ytdlp_line(self, line: str) -> None:
         log.debug("yt-dlp: %s", line)
-        # 解析进度百分比
-        m = self._PROGRESS_RE.match(line)
-        if m:
-            percent = float(m.group(1)) / 100.0
-            self.progress_sig.emit(percent)
-            self.status_sig.emit(f"下载中… {m.group(1)}%")
-        elif line.startswith("[download] Destination:"):
-            fname = line.split("Destination:", 1)[1].strip()
-            self.status_sig.emit(f"保存为：{Path(fname).name}")
-        elif line.startswith("[download]"):
-            # 其余 download 消息
-            pass
+        if line.startswith("WARNING:"):
+            log.warning("yt-dlp: %s", line)
         elif line.startswith("ERROR:"):
-            raise RuntimeError(line)
+            log.error("yt-dlp: %s", line)
+
+        match = re.search(r"\[download\]\s+(\d{1,3}(?:\.\d+)?)%", line)
+        if match:
+            self.progress_sig.emit(float(match.group(1)) / 100.0)
+            return
+
+        if line.startswith("[download] Destination:"):
+            filename = line.split("Destination:", 1)[1].strip()
+            self.status_sig.emit(f"下载中：{Path(filename).name}")
+        elif line.startswith("[Merger]") or line.startswith("[ExtractAudio]"):
+            self.status_sig.emit("正在合并音视频或转换封装...")
+
+    def _output_snapshot(self) -> set[Path]:
+        if not self._out_dir.exists():
+            return set()
+        return {path for path in self._out_dir.iterdir() if path.is_file()}
+
+    def _cleanup_failed_attempt(self, before: set[Path]) -> None:
+        if not self._out_dir.exists():
+            return
+
+        for path in self._out_dir.iterdir():
+            if path in before or not path.is_file():
+                continue
+            try:
+                if path.suffix in {".part", ".ytdl", ".temp"} or path.stat().st_size == 0:
+                    path.unlink()
+            except OSError:
+                log.debug("failed to clean partial download: %s", path, exc_info=True)
+
+
+def _friendly_ytdlp_error(message: str) -> str:
+    lower = message.lower()
+    hints: list[str] = []
+
+    if "http error 412" in lower and "bilibili" in lower:
+        hints.append("B 站接口返回 412，通常是风控、登录态或 yt-dlp 版本适配问题。请更新 yt-dlp，并尝试启用浏览器 cookies。")
+    if "failed to load cookies" in lower:
+        hints.append("读取浏览器 cookies 失败。请确认浏览器已安装并登录，必要时关闭浏览器后重试。")
+    if "ffmpeg" in lower or "ffprobe" in lower:
+        hints.append("未找到 ffmpeg，或 ffmpeg 无法正常运行。需要合并音视频或转为 MP4 时必须安装 ffmpeg。")
+    if "sign in" in lower or "login" in lower or "cookies" in lower:
+        hints.append("该视频可能需要登录或浏览器 cookies。")
+    if "private video" in lower or "not available" in lower or "unavailable" in lower:
+        hints.append("该视频可能不可访问、被设为私有、下架，或受到地区限制。")
+    if "requested format is not available" in lower or "format is not available" in lower:
+        hints.append("所选清晰度或格式不可用，可以尝试选择“最佳质量”。")
+    if "http error 403" in lower or "forbidden" in lower:
+        hints.append("服务器拒绝访问，可能是链接过期、需要登录、地区限制或反爬策略导致。")
+    if "timed out" in lower or "timeout" in lower or "connection" in lower:
+        hints.append("网络连接超时或中断，请检查网络后重试。")
+
+    if not hints:
+        return message
+
+    return "\n".join([*hints, "", "yt-dlp 原始错误：", message])
+
+
+__all__ = ["DownloadTask", "DownloaderWorker"]

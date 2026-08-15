@@ -1,41 +1,79 @@
-/* 基础配色 */
 QWidget {
     font-size: 14px;
-    background: #2b2b2b;
-    color: #e0e0e0;
+    background: #24272e;
+    color: #eef0f4;
 }
 
-/* 输入框 & 进度条 */
-QLineEdit, QProgressBar {
-    border: 1px solid #444;
+QLabel {
+    background: transparent;
+}
+
+QLineEdit,
+QComboBox {
+    border: 1px solid #4a5060;
     border-radius: 6px;
-    padding: 4px 6px;
-    background: #404040;
+    padding: 6px 8px;
+    background: #30343d;
+    selection-background-color: #2f80ed;
+}
+
+QLineEdit:focus,
+QComboBox:focus {
+    border-color: #6aa7ff;
+}
+
+QPushButton {
+    background: #3b414d;
+    border: 1px solid #596172;
+    border-radius: 6px;
+    padding: 7px 12px;
+}
+
+QPushButton:hover {
+    background: #464d5a;
+}
+
+QPushButton:pressed {
+    background: #313640;
+}
+
+QPushButton:disabled,
+QLineEdit:disabled,
+QTableWidget:disabled {
+    color: #8f96a3;
+    background: #2b2f37;
+}
+
+QTableWidget {
+    gridline-color: #3d4350;
+    background: #292d35;
+    alternate-background-color: #30343d;
+    selection-background-color: #345f8f;
+    selection-color: #ffffff;
+}
+
+QHeaderView::section {
+    background: #353b46;
+    color: #f5f6f8;
+    border: 0;
+    border-right: 1px solid #454c59;
+    padding: 7px;
+}
+
+QProgressBar {
+    border: 1px solid #4a5060;
+    border-radius: 6px;
+    background: #30343d;
+    text-align: center;
+    min-height: 18px;
 }
 
 QProgressBar::chunk {
-    border-radius: 6px;
-    background-color: #00b894;          /* 青绿色进度块 */
+    border-radius: 5px;
+    background-color: #2f80ed;
 }
 
-/* 表格 */
-QTableWidget {
-    gridline-color: #555;
-    selection-background-color: #34495e; /* 选中行蓝灰 */
-    alternate-background-color: #333;
+QCheckBox {
+    background: transparent;
+    spacing: 8px;
 }
-QHeaderView::section {
-    background: #3c3c3c;
-    border: 0;
-    padding: 6px;
-}
-
-/* 按钮 – 默认 / Hover / 按下 */
-QPushButton {
-    background: #3c3c3c;
-    border: 1px solid #555;
-    border-radius: 8px;
-    padding: 6px 12px;
-}
-QPushButton:hover { background: #505050; }
-QPushButton:pressed { background: #2d2d2d; }

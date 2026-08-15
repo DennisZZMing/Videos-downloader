@@ -1,210 +1,303 @@
-"""
-基于 PySide6 + qtawesome 的主窗口：粘贴 URL→列出条目→逐行选清晰度→批量下载
-"""
 from __future__ import annotations
 
 import logging
+import shutil
 from pathlib import Path
-from typing import List, Tuple
 
-import qtawesome as qta
+try:
+    import qtawesome as qta
+except Exception:  # pragma: no cover
+    qta = None
+
 from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QCheckBox,
+    QComboBox,
     QFileDialog,
     QGridLayout,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMessageBox,
-    QPushButton,
     QProgressBar,
-    QVBoxLayout,
-    QWidget,
+    QPushButton,
     QTableWidget,
     QTableWidgetItem,
-    QHeaderView,
-    QAbstractItemView,
-    QComboBox,
+    QVBoxLayout,
+    QWidget,
 )
 
-from .downloader import DownloaderWorker
-from .formats import FormatsFetcher, VideoItem
+from .downloader import DownloadTask, DownloaderWorker
+from .formats import FormatsFetcher, VideoItem, _duration_text
 
 log = logging.getLogger(__name__)
 
-QUALITY_OPTIONS = ["best", "1080p", "720p", "480p", "audio"]
+
+def _icon(name: str) -> QIcon:
+    if qta is None:
+        return QIcon()
+    return qta.icon(name, color="#f3f4f6")
 
 
 class MainWindow(QWidget):
-    # -------- 自定义信号 --------
-    _on_progress = Signal(float)           # 下载进度 0.0 – 1.0
-    _on_status = Signal(str)               # 状态栏文本
-    _on_finished = Signal(bool, object)    # 全部下载完成 (success, err)
+    _on_progress = Signal(float)
+    _on_status = Signal(str)
+    _on_finished = Signal(bool, object)
 
-    # -------- 初始化 --------
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Videos Downloader (yt-dlp GUI)")
-        self.resize(820, 520)              # 稍宽一点，表格不拥挤
-
-        self._setup_ui()
-        self._connect_signals()
+        self.setWindowTitle("Videos Downloader")
+        self.resize(980, 660)
 
         self._worker: DownloaderWorker | None = None
         self._fetcher: FormatsFetcher | None = None
 
-    # -------- UI 构建 --------
+        self._setup_ui()
+        self._connect_signals()
+        self._set_busy(False)
+
     def _setup_ui(self) -> None:
-        # —— 输入行 —— #
-        self.url_edit = QLineEdit(placeholderText="粘贴视频 / 播放列表 URL …")
+        self.url_edit = QLineEdit()
+        self.url_edit.setPlaceholderText("粘贴视频或播放列表链接")
+        self.url_edit.setClearButtonEnabled(True)
+
+        self.parse_btn = QPushButton("解析链接")
+        self.parse_btn.setIcon(_icon("fa5s.search"))
+
+        self.output_edit = QLineEdit(str(Path.home() / "Downloads"))
+        self.output_edit.setPlaceholderText("选择保存目录")
 
         self.choose_btn = QPushButton()
-        self.choose_btn.setIcon(qta.icon("fa5s.folder-open", color="#dcdcdc"))
-        self.choose_btn.setToolTip("选择下载目录")
+        self.choose_btn.setIcon(_icon("fa5s.folder-open"))
+        self.choose_btn.setToolTip("选择保存目录")
 
-        self.output_edit = QLineEdit()
+        self.cookies_combo = QComboBox()
+        self.cookies_combo.addItem("不使用 cookies", None)
+        self.cookies_combo.addItem("从 Chrome 读取", "chrome")
+        self.cookies_combo.addItem("从 Edge 读取", "edge")
+        self.cookies_combo.addItem("从 Firefox 读取", "firefox")
+        self.cookies_combo.setToolTip("用于需要登录态的网站，例如 B 站高清、合集或风控场景")
+
+        self.select_all = QCheckBox("全选")
+        self.select_all.setChecked(True)
 
         self.download_btn = QPushButton("开始下载")
-        self.download_btn.setIcon(qta.icon("fa5s.download", color="#dcdcdc"))
+        self.download_btn.setIcon(_icon("fa5s.download"))
+        self.download_btn.setEnabled(False)
 
-        # —— 状态 & 进度 —— #
-        self.progress = QProgressBar()
-        self.progress.setMinimum(0)
-        self.progress.setMaximum(100)
-        self.status_label = QLabel("等待中…")
-
-        # —— 列表 —— #
         self.table = QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(["选择", "标题", "时长", "清晰度"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.table.verticalHeader().setDefaultSectionSize(28)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(36)
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setWordWrap(False)
 
-        # —— 布局 —— #
-        grid = QGridLayout()
-        grid.addWidget(QLabel("视频地址："), 0, 0)
-        grid.addWidget(self.url_edit, 0, 1, 1, 2)
-        grid.addWidget(QLabel("保存到："), 1, 0)
-        grid.addWidget(self.output_edit, 1, 1)
-        grid.addWidget(self.choose_btn, 1, 2)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
 
-        hbox = QHBoxLayout()
-        hbox.addStretch()
-        hbox.addWidget(self.download_btn)
+        self.status_label = QLabel("等待解析链接")
+        self.status_label.setWordWrap(True)
 
-        vbox = QVBoxLayout(self)
-        vbox.setContentsMargins(12, 12, 12, 12)
-        vbox.setSpacing(10)
-        vbox.addLayout(grid)
-        vbox.addWidget(self.table)
-        vbox.addLayout(hbox)
-        vbox.addWidget(self.progress)
-        vbox.addWidget(self.status_label)
+        form = QGridLayout()
+        form.setColumnStretch(1, 1)
+        form.addWidget(QLabel("链接"), 0, 0)
+        form.addWidget(self.url_edit, 0, 1)
+        form.addWidget(self.parse_btn, 0, 2)
+        form.addWidget(QLabel("保存到"), 1, 0)
+        form.addWidget(self.output_edit, 1, 1)
+        form.addWidget(self.choose_btn, 1, 2)
+        form.addWidget(QLabel("登录态"), 2, 0)
+        form.addWidget(self.cookies_combo, 2, 1)
 
-    # -------- 信号 / 槽 --------
+        toolbar = QHBoxLayout()
+        toolbar.addWidget(self.select_all)
+        toolbar.addStretch()
+        toolbar.addWidget(self.download_btn)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(12)
+        root.addLayout(form)
+        root.addLayout(toolbar)
+        root.addWidget(self.table, 1)
+        root.addWidget(self.progress)
+        root.addWidget(self.status_label)
+
     def _connect_signals(self) -> None:
+        self.parse_btn.clicked.connect(self._fetch_entries)
+        self.url_edit.returnPressed.connect(self._fetch_entries)
         self.choose_btn.clicked.connect(self._choose_dir)
         self.download_btn.clicked.connect(self._start_download)
+        self.select_all.stateChanged.connect(self._toggle_all_rows)
 
-        self._on_progress.connect(self.progress.setValue)
+        self._on_progress.connect(self._set_progress)
         self._on_status.connect(self.status_label.setText)
         self._on_finished.connect(self._on_download_finished)
 
-        # 地址行回车或失焦时自动解析列表
-        self.url_edit.editingFinished.connect(self._fetch_entries)
+    def _set_busy(self, busy: bool) -> None:
+        self.url_edit.setEnabled(not busy)
+        self.parse_btn.setEnabled(not busy)
+        self.output_edit.setEnabled(not busy)
+        self.choose_btn.setEnabled(not busy)
+        self.cookies_combo.setEnabled(not busy)
+        self.download_btn.setEnabled(not busy and self.table.rowCount() > 0)
+        self.select_all.setEnabled(not busy and self.table.rowCount() > 0)
+        self.table.setEnabled(not busy)
 
-    # -------- 获取条目列表 --------
+    @Slot()
     def _fetch_entries(self) -> None:
         url = self.url_edit.text().strip()
         if not url:
+            QMessageBox.warning(self, "缺少链接", "请先粘贴视频或播放列表链接。")
             return
 
-        self._on_status.emit("正在获取视频列表…")
-        self.table.setRowCount(0)
+        if self._fetcher and self._fetcher.isRunning():
+            return
 
-        self._fetcher = FormatsFetcher(url)
+        self.table.setRowCount(0)
+        self.progress.setValue(0)
+        self._on_status.emit("正在解析链接...")
+        self._set_busy(True)
+
+        self._fetcher = FormatsFetcher(url, self._selected_cookies_browser())
+        self._fetcher.status_sig.connect(self._on_status)
         self._fetcher.result_sig.connect(self._populate_table)
-        self._fetcher.error_sig.connect(lambda e: QMessageBox.critical(self, "获取失败", e))
+        self._fetcher.error_sig.connect(self._on_fetch_error)
+        self._fetcher.finished.connect(lambda: self._set_busy(False))
         self._fetcher.start()
 
     @Slot(list)
-    def _populate_table(self, items: List[VideoItem]) -> None:
+    def _populate_table(self, items: list[VideoItem]) -> None:
         self.table.setRowCount(len(items))
 
-        for row, itm in enumerate(items):
-            # 0 选择列：复选框
-            chk = QTableWidgetItem()
-            chk.setCheckState(Qt.Unchecked if row else Qt.Checked)  # 默认勾选首行
-            self.table.setItem(row, 0, chk)
+        for row, item in enumerate(items):
+            checkbox = QTableWidgetItem()
+            checkbox.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            checkbox.setCheckState(Qt.Checked if self.select_all.isChecked() else Qt.Unchecked)
+            self.table.setItem(row, 0, checkbox)
 
-            # 1 标题列：显示 title，UserRole 存真实 URL
-            cell_title = QTableWidgetItem(itm["title"])
-            cell_title.setData(Qt.UserRole, itm["url"])
-            self.table.setItem(row, 1, cell_title)
+            title = QTableWidgetItem(item["title"])
+            title.setData(Qt.UserRole, item["url"])
+            self.table.setItem(row, 1, title)
 
-            # 2 时长列：mm:ss
-            dur = itm["duration"]
-            dur_str = "-" if dur is None else f"{int(dur)//60}:{int(dur)%60:02}"
-            self.table.setItem(row, 2, QTableWidgetItem(dur_str))
+            duration = QTableWidgetItem(_duration_text(item["duration"]))
+            duration.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(row, 2, duration)
 
-            # 3 清晰度列：ComboBox（默认 best）
-            cb = QComboBox()
-            cb.addItems(QUALITY_OPTIONS)
-            self.table.setCellWidget(row, 3, cb)
+            formats = QComboBox()
+            for fmt in item["formats"]:
+                formats.addItem(fmt["label"], fmt["download_expr"])
+            formats.setMinimumWidth(230)
+            self.table.setCellWidget(row, 3, formats)
 
-        self._on_status.emit(f"共 {len(items)} 条目，可逐行选择清晰度后下载")
+        self.download_btn.setEnabled(bool(items))
+        self.select_all.setEnabled(bool(items))
+        self._on_status.emit(f"已解析 {len(items)} 个条目，可选择清晰度后下载。")
 
-    # -------- 目录选择 --------
+    @Slot(str)
+    def _on_fetch_error(self, message: str) -> None:
+        self._on_status.emit("解析失败")
+        QMessageBox.critical(self, "解析失败", message or "无法解析该链接。")
+
     @Slot()
     def _choose_dir(self) -> None:
         path = QFileDialog.getExistingDirectory(
-            self, "选择下载目录", str(Path.home()), QFileDialog.ShowDirsOnly
+            self,
+            "选择保存目录",
+            self.output_edit.text().strip() or str(Path.home()),
+            QFileDialog.ShowDirsOnly,
         )
         if path:
             self.output_edit.setText(path)
 
-    # -------- 开始下载 --------
+    @Slot(int)
+    def _toggle_all_rows(self, state: int) -> None:
+        check_state = Qt.Checked if state == Qt.CheckState.Checked.value else Qt.Unchecked
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item:
+                item.setCheckState(check_state)
+
     @Slot()
     def _start_download(self) -> None:
-        tasks: List[Tuple[str, str]] = []  # (url, quality)
-
-        for r in range(self.table.rowCount()):
-            if self.table.item(r, 0).checkState() == Qt.Checked:
-                url = self.table.item(r, 1).data(Qt.UserRole)
-                cb: QComboBox = self.table.cellWidget(r, 3)  # type: ignore
-                quality = cb.currentText() if cb else "best"
-                tasks.append((url, quality))
-
+        tasks = self._selected_tasks()
         if not tasks:
-            QMessageBox.warning(self, "提示", "请选择至少一项要下载")
+            QMessageBox.warning(self, "未选择条目", "请至少勾选一个要下载的视频。")
+            return
+
+        if self._needs_ffmpeg(tasks) and not shutil.which("ffmpeg"):
+            QMessageBox.critical(
+                self,
+                "缺少 ffmpeg",
+                "当前选择可能需要合并音视频或转换为 MP4，但系统未找到 ffmpeg。\n\n"
+                "请先安装 ffmpeg，并确保 ffmpeg 命令可以在终端中直接运行。",
+            )
             return
 
         out_dir = Path(self.output_edit.text().strip() or ".").expanduser()
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        self.download_btn.setEnabled(False)
         self.progress.setValue(0)
-        self._on_status.emit("正在准备下载…")
+        self._on_status.emit("正在准备下载...")
+        self._set_busy(True)
 
-        self._worker = DownloaderWorker(tasks, out_dir)
-        self._worker.progress_sig.connect(self._on_progress_from_worker)
+        self._worker = DownloaderWorker(tasks, out_dir, self._selected_cookies_browser())
+        self._worker.progress_sig.connect(self._on_progress)
         self._worker.status_sig.connect(self._on_status)
         self._worker.finished_sig.connect(self._on_finished)
         self._worker.start()
 
-    # -------- 子线程回调 --------
+    def _selected_cookies_browser(self) -> str | None:
+        browser = self.cookies_combo.currentData()
+        return str(browser) if browser else None
+
+    def _selected_tasks(self) -> list[DownloadTask]:
+        tasks: list[DownloadTask] = []
+        for row in range(self.table.rowCount()):
+            checkbox = self.table.item(row, 0)
+            title_item = self.table.item(row, 1)
+            combo = self.table.cellWidget(row, 3)
+            if (
+                checkbox is None
+                or title_item is None
+                or checkbox.checkState() != Qt.Checked
+                or not isinstance(combo, QComboBox)
+            ):
+                continue
+
+            tasks.append(
+                {
+                    "title": title_item.text(),
+                    "url": str(title_item.data(Qt.UserRole)),
+                    "format_expr": str(combo.currentData() or "bestvideo+bestaudio/best"),
+                    "format_label": combo.currentText(),
+                }
+            )
+        return tasks
+
+    def _needs_ffmpeg(self, tasks: list[DownloadTask]) -> bool:
+        return any("+" in task["format_expr"] for task in tasks)
+
     @Slot(float)
-    def _on_progress_from_worker(self, percent: float) -> None:
-        self._on_progress.emit(int(percent * 100))
+    def _set_progress(self, value: float) -> None:
+        self.progress.setValue(int(max(0.0, min(value, 1.0)) * 100))
 
     @Slot(bool, object)
     def _on_download_finished(self, success: bool, err: str | None) -> None:
-        self.download_btn.setEnabled(True)
+        self._set_busy(False)
         if success:
-            self._on_status.emit("下载完成 ✅")
-        else:
-            self._on_status.emit("下载失败 ❌")
-            QMessageBox.critical(self, "下载失败", err or "未知错误")
+            self._on_status.emit("下载完成")
+            return
+
+        self._on_status.emit("下载失败")
+        QMessageBox.critical(self, "下载失败", err or "未知错误")
